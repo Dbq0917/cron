@@ -36,6 +36,28 @@ them in their own goroutines.
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
 
+Observability
+
+Every entry records runtime observability data that can be read at any time,
+without adding logs inside the job. Take a snapshot via Entry.Stats,
+Cron.EntryStats or Cron.Stats:
+
+	stats := c.EntryStats(id)
+	fmt.Println(stats.Activations, stats.Runs, stats.Skips, stats.Misses)
+	fmt.Println(stats.LastStart, stats.LastFinish, stats.LastDuration)
+	fmt.Println(stats.Next) // the next scheduled activation
+
+The counters distinguish the reasons an activation did not do work:
+
+	Activations — times the scheduler dispatched the entry
+	Runs        — activations whose job body actually executed
+	Skips       — activations suppressed by a wrapper (e.g. SkipIfStillRunning)
+	Misses      — scheduled activations that fired late because the scheduler
+	              was blocked or asleep when they were due
+
+Recording an activation or a run uses atomic operations only and never takes
+a lock, so the instrumentation is cheap enough to leave permanently enabled.
+
 CRON Expression Format
 
 A cron expression represents a set of times, using 5 space-separated fields.

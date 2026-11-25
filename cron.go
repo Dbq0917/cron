@@ -69,6 +69,21 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	// stats collects runtime observability data for this entry. It is created
+	// once when the entry is scheduled and updated without locks while the
+	// scheduler runs. Use Stats() to read a consistent snapshot.
+	stats *entryStats
+}
+
+// Stats returns a point-in-time snapshot of this entry's runtime
+// observability data: activation/run/skip/miss counts, running invocations,
+// last start and finish times and the run durations.
+func (e Entry) Stats() EntryStats {
+	if e.stats == nil {
+		return EntryStats{Next: e.Next, Prev: e.Prev}
+	}
+	return e.stats.snapshot(e.Next, e.Prev)
 }
 
 // Valid returns true if this is not the zero entry.
@@ -159,11 +174,13 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
+	stats := newEntryStats(c.location)
 	entry := &Entry{
 		ID:         c.nextID,
 		Schedule:   schedule,
-		WrappedJob: c.chain.Then(cmd),
+		WrappedJob: c.chain.Then(observedJob{job: cmd, stats: stats}),
 		Job:        cmd,
+		stats:      stats,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -198,6 +215,23 @@ func (c *Cron) Entry(id EntryID) Entry {
 		}
 	}
 	return Entry{}
+}
+
+// Stats returns a point-in-time snapshot of the runtime observability data
+// for every entry, in the same order as Entries().
+func (c *Cron) Stats() []EntryStats {
+	entries := c.Entries()
+	stats := make([]EntryStats, len(entries))
+	for i, entry := range entries {
+		stats[i] = entry.Stats()
+	}
+	return stats
+}
+
+// EntryStats returns a point-in-time snapshot of the runtime observability
+// data for the given entry, or the zero EntryStats if it cannot be found.
+func (c *Cron) EntryStats(id EntryID) EntryStats {
+	return c.Entry(id).Stats()
 }
 
 // Remove an entry from being run in the future.
@@ -270,9 +304,12 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
+					scheduled := e.Next
+					nextScheduled := e.Schedule.Next(now)
+					e.stats.observe(scheduled, now, nextScheduled)
 					c.startJob(e.WrappedJob)
 					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
+					e.Next = nextScheduled
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
