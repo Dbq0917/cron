@@ -219,13 +219,14 @@ Activate it with a one-off logger as follows:
 
 Implementation
 
-Cron entries are stored in an array, sorted by their next activation time.  Cron
-sleeps until the next job is due to be run.
+Cron entries are stored in a min-heap ordered by their next activation time.
+Cron sleeps until the next job is due to be run.
 
 Upon waking:
- - it runs each entry that is active on that second
+ - it removes and runs each entry that is due
  - it calculates the next run times for the jobs that were run
- - it re-sorts the array of entries by next activation time.
- - it goes to sleep until the soonest job.
+ - it inserts the rescheduled entries back into the heap
+ - it resets its timer using the current time and goes back to sleep until the
+   soonest job.
 */
 package cron

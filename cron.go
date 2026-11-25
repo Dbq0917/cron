@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"container/heap"
 	"context"
 	"sort"
 	"sync"
@@ -12,6 +13,7 @@ import (
 // be inspected while running.
 type Cron struct {
 	entries   []*Entry
+	entryByID map[EntryID]*Entry
 	chain     Chain
 	stop      chan struct{}
 	add       chan *Entry
@@ -69,6 +71,8 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	heapIndex int
 }
 
 // Valid returns true if this is not the zero entry.
@@ -78,19 +82,47 @@ func (e Entry) Valid() bool { return e.ID != 0 }
 // (with zero time at the end).
 type byTime []*Entry
 
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s byTime) Len() int { return len(s) }
+func (s byTime) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+	s[i].heapIndex = i
+	s[j].heapIndex = j
+}
 func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
+	return entryLess(s[i], s[j])
+}
+
+func entryLess(left, right *Entry) bool {
+	// A zero time is not schedulable and sorts after every concrete time.
+	// Ties use ID so equal-time entries keep insertion order.
+	leftZero := left.Next.IsZero()
+	rightZero := right.Next.IsZero()
+	if leftZero || rightZero {
+		if leftZero && rightZero {
+			return left.ID < right.ID
+		}
+		return !leftZero
 	}
-	if s[j].Next.IsZero() {
-		return true
+	if left.Next.Equal(right.Next) {
+		return left.ID < right.ID
 	}
-	return s[i].Next.Before(s[j].Next)
+	return left.Next.Before(right.Next)
+}
+
+func (s *byTime) Push(x interface{}) {
+	entry := x.(*Entry)
+	entry.heapIndex = len(*s)
+	*s = append(*s, entry)
+}
+
+func (s *byTime) Pop() interface{} {
+	old := *s
+	n := len(old)
+	entry := old[n-1]
+	old[n-1] = nil
+	*s = old[:n-1]
+	entry.heapIndex = -1
+	return entry
 }
 
 // New returns a new Cron job runner, modified by the given options.
@@ -113,6 +145,7 @@ func (s byTime) Less(i, j int) bool {
 func New(opts ...Option) *Cron {
 	c := &Cron{
 		entries:   nil,
+		entryByID: make(map[EntryID]*Entry),
 		chain:     NewChain(),
 		add:       make(chan *Entry),
 		stop:      make(chan struct{}),
@@ -164,9 +197,10 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
+		heapIndex:  -1,
 	}
 	if !c.running {
-		c.entries = append(c.entries, entry)
+		c.addEntry(entry)
 	} else {
 		c.add <- entry
 	}
@@ -245,62 +279,78 @@ func (c *Cron) run() {
 		entry.Next = entry.Schedule.Next(now)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
+	queue := (*byTime)(&c.entries)
+	heap.Init(queue)
 
+	var timer *time.Timer
 	for {
-		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
+		now = c.now()
 
-		var timer *time.Timer
-		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
+		var delay time.Duration
+		if queue.Len() == 0 || (*queue)[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
-			timer = time.NewTimer(100000 * time.Hour)
+			delay = 100000 * time.Hour
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			delay = (*queue)[0].Next.Sub(now)
+		}
+		if timer == nil {
+			timer = time.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
 		}
 
-		for {
-			select {
-			case now = <-timer.C:
-				now = now.In(c.location)
-				c.logger.Info("wake", "now", now)
+		select {
+		case wake := <-timer.C:
+			now = wake.In(c.location)
+			c.logger.Info("wake", "now", now)
 
-				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
-					if e.Next.After(now) || e.Next.IsZero() {
-						break
-					}
-					c.startJob(e.WrappedJob)
-					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
-					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
+			var due []*Entry
+			// Run every entry whose next time was less than now.
+			for queue.Len() > 0 {
+				entry := (*queue)[0]
+				if entry.Next.After(now) || entry.Next.IsZero() {
+					break
 				}
+				entry = heap.Pop(queue).(*Entry)
+				due = append(due, entry)
 
-			case newEntry := <-c.add:
-				timer.Stop()
-				now = c.now()
-				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
-				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
-
-			case replyChan := <-c.snapshot:
-				replyChan <- c.entrySnapshot()
-				continue
-
-			case <-c.stop:
-				timer.Stop()
-				c.logger.Info("stop")
-				return
-
-			case id := <-c.remove:
-				timer.Stop()
-				now = c.now()
-				c.removeEntry(id)
-				c.logger.Info("removed", "entry", id)
+				c.startJob(entry.WrappedJob)
+				entry.Prev = entry.Next
+				entry.Next = entry.Schedule.Next(now)
+				c.logger.Info("run", "now", now, "entry", entry.ID, "next", entry.Next)
+			}
+			for _, entry := range due {
+				heap.Push(queue, entry)
 			}
 
-			break
+		case newEntry := <-c.add:
+			stopTimer(timer)
+			now = c.now()
+			newEntry.Next = newEntry.Schedule.Next(now)
+			c.addEntry(newEntry)
+			c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
+
+		case replyChan := <-c.snapshot:
+			replyChan <- c.entrySnapshot()
+			stopTimer(timer)
+
+		case <-c.stop:
+			timer.Stop()
+			c.logger.Info("stop")
+			return
+
+		case id := <-c.remove:
+			stopTimer(timer)
+			c.removeEntry(id)
+			c.logger.Info("removed", "entry", id)
 		}
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		<-timer.C
 	}
 }
 
@@ -341,15 +391,48 @@ func (c *Cron) entrySnapshot() []Entry {
 	for i, e := range c.entries {
 		entries[i] = *e
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entryLess(&entries[i], &entries[j])
+	})
 	return entries
 }
 
+func (c *Cron) addEntry(entry *Entry) {
+	if c.entryByID == nil {
+		c.entryByID = make(map[EntryID]*Entry)
+	}
+	c.entryByID[entry.ID] = entry
+	heap.Push((*byTime)(&c.entries), entry)
+}
+
 func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
-	for _, e := range c.entries {
-		if e.ID != id {
-			entries = append(entries, e)
+	if c.entryByID == nil {
+		var entries []*Entry
+		for _, candidate := range c.entries {
+			if candidate.ID != id {
+				entries = append(entries, candidate)
+			}
+		}
+		c.entries = entries
+		return
+	}
+
+	entry := c.entryByID[id]
+	if entry == nil {
+		return
+	}
+	delete(c.entryByID, id)
+	if entry.heapIndex < 0 || entry.heapIndex >= len(c.entries) || c.entries[entry.heapIndex] != entry {
+		entry.heapIndex = -1
+		for i, candidate := range c.entries {
+			if candidate == entry {
+				entry.heapIndex = i
+				break
+			}
 		}
 	}
-	c.entries = entries
+	if entry.heapIndex < 0 {
+		return
+	}
+	heap.Remove((*byTime)(&c.entries), entry.heapIndex)
 }
