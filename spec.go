@@ -7,6 +7,12 @@ import "time"
 type SpecSchedule struct {
 	Second, Minute, Hour, Dom, Month, Dow uint64
 
+	// Fractions holds the sub-second offsets, in nanoseconds within a second,
+	// at which this schedule is activated, in ascending order. It is empty for
+	// schedules with whole-second granularity, which activate at the start of
+	// each matched second.
+	Fractions []int
+
 	// Override location for this schedule.
 	Location *time.Location
 }
@@ -78,8 +84,13 @@ func (s *SpecSchedule) Next(t time.Time) time.Time {
 		t = t.In(s.Location)
 	}
 
-	// Start at the earliest possible time (the upcoming second).
-	t = t.Add(1*time.Second - time.Duration(t.Nanosecond())*time.Nanosecond)
+	// Start at the earliest possible time: the upcoming second, or, for
+	// schedules with sub-second precision, the upcoming nanosecond.
+	if len(s.Fractions) == 0 {
+		t = t.Add(1*time.Second - time.Duration(t.Nanosecond())*time.Nanosecond)
+	} else {
+		t = t.Add(time.Nanosecond)
+	}
 
 	// This flag indicates whether a field has been incremented.
 	added := false
@@ -168,6 +179,32 @@ WRAP:
 
 		if t.Second() == 0 {
 			goto WRAP
+		}
+	}
+
+	if len(s.Fractions) > 0 {
+		// Move to the next sub-second offset within the matched second. The
+		// input time was already advanced past its own instant, so an offset
+		// equal to the current nanosecond still satisfies it.
+		offset := -1
+		for _, f := range s.Fractions {
+			if f >= t.Nanosecond() {
+				offset = f
+				break
+			}
+		}
+		if offset >= 0 {
+			t = t.Add(time.Duration(offset-t.Nanosecond()) * time.Nanosecond)
+		} else {
+			// All offsets within this second have passed; roll over to the
+			// first offset of the next second matched by the schedule.
+			t = t.Truncate(time.Second).Add(time.Second + time.Duration(s.Fractions[0])*time.Nanosecond)
+			for 1<<uint(t.Second())&s.Second == 0 {
+				t = t.Add(1 * time.Second)
+				if t.Second() == 0 {
+					goto WRAP
+				}
+			}
 		}
 	}
 

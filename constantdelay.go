@@ -3,25 +3,25 @@ package cron
 import "time"
 
 // ConstantDelaySchedule represents a simple recurring duty cycle, e.g. "Every 5 minutes".
-// It does not support jobs more frequent than once a second.
+// It supports sub-second delays at their original precision.
 type ConstantDelaySchedule struct {
 	Delay time.Duration
 }
 
 // Every returns a crontab Schedule that activates once every duration.
-// Delays of less than a second are not supported (will round up to 1 second).
-// Any fields less than a Second are truncated.
+// The delay is kept at its original precision, including sub-second delays.
 func Every(duration time.Duration) ConstantDelaySchedule {
-	if duration < time.Second {
-		duration = time.Second
+	if duration < time.Nanosecond {
+		duration = time.Nanosecond
 	}
 	return ConstantDelaySchedule{
-		Delay: duration - time.Duration(duration.Nanoseconds())%time.Second,
+		Delay: duration,
 	}
 }
 
 // Next returns the next time this should be run.
-// This rounds so that the next activation time will be on the second.
+// This rounds up so that the next activation time falls on a multiple of the
+// delay, keeping activations aligned to the schedule's own precision.
 func (schedule ConstantDelaySchedule) Next(t time.Time) time.Time {
-	return t.Add(schedule.Delay - time.Duration(t.Nanosecond())*time.Nanosecond)
+	return t.Add(schedule.Delay - time.Duration(t.Nanosecond())%schedule.Delay)
 }

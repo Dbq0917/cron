@@ -3,6 +3,7 @@ package cron
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +121,10 @@ func (p Parser) Parse(spec string) (Schedule, error) {
 		return nil, err
 	}
 
+	// The seconds field additionally accepts decimal values (e.g. "0.5" or
+	// "*/0.5") so that schedules may activate at sub-second precision.
+	second, fractions, err := getFractionalField(fields[0], seconds)
+
 	field := func(field string, r bounds) uint64 {
 		if err != nil {
 			return 0
@@ -130,7 +135,6 @@ func (p Parser) Parse(spec string) (Schedule, error) {
 	}
 
 	var (
-		second     = field(fields[0], seconds)
 		minute     = field(fields[1], minutes)
 		hour       = field(fields[2], hours)
 		dayofmonth = field(fields[3], dom)
@@ -142,13 +146,14 @@ func (p Parser) Parse(spec string) (Schedule, error) {
 	}
 
 	return &SpecSchedule{
-		Second:   second,
-		Minute:   minute,
-		Hour:     hour,
-		Dom:      dayofmonth,
-		Month:    month,
-		Dow:      dayofweek,
-		Location: loc,
+		Second:    second,
+		Minute:    minute,
+		Hour:      hour,
+		Dom:       dayofmonth,
+		Month:     month,
+		Dow:       dayofweek,
+		Fractions: fractions,
+		Location:  loc,
 	}, nil
 }
 
@@ -338,6 +343,166 @@ func mustParseInt(expr string) (uint, error) {
 	}
 
 	return uint(num), nil
+}
+
+// getFractionalField is like getField, but also accepts decimal values (such
+// as "0.5" or "*/0.5") so that sub-second activation times can be expressed.
+// Along with the whole-second bits, it returns the sorted, de-duplicated
+// sub-second offsets (in nanoseconds) at which the schedule activates within
+// each matched second. The offsets are nil when the field uses only whole
+// seconds. The offsets apply to every second matched by the returned bits.
+func getFractionalField(field string, r bounds) (uint64, []int, error) {
+	var bits uint64
+	fractionSet := make(map[int]struct{})
+	hasFractional := false
+	hasWhole := false
+	ranges := strings.FieldsFunc(field, func(r rune) bool { return r == ',' })
+	for _, expr := range ranges {
+		bit, fractions, err := getFractionalRange(expr, r)
+		if err != nil {
+			return bits, nil, err
+		}
+		bits |= bit
+		if fractions == nil {
+			hasWhole = true
+			continue
+		}
+		hasFractional = true
+		for _, f := range fractions {
+			fractionSet[f] = struct{}{}
+		}
+	}
+	if !hasFractional {
+		return bits, nil, nil
+	}
+	// A range written with whole seconds activates at the start of a second,
+	// so keep that offset alongside any fractional ones.
+	if hasWhole {
+		fractionSet[0] = struct{}{}
+	}
+	fractions := make([]int, 0, len(fractionSet))
+	for f := range fractionSet {
+		fractions = append(fractions, f)
+	}
+	sort.Ints(fractions)
+	return bits, fractions, nil
+}
+
+// getFractionalRange is like getRange, except that the range bounds and step
+// may be decimal numbers, allowing sub-second precision. Whole seconds are
+// returned as bits, while the distinct sub-second offsets within a second are
+// returned in nanoseconds. A nil offsets slice means the expression used only
+// whole seconds.
+func getFractionalRange(expr string, r bounds) (uint64, []int, error) {
+	if !strings.Contains(expr, ".") {
+		bits, err := getRange(expr, r)
+		return bits, nil, err
+	}
+
+	var (
+		start, end, step float64
+		rangeAndStep     = strings.Split(expr, "/")
+		lowAndHigh       = strings.Split(rangeAndStep[0], "-")
+		singleDigit      = len(lowAndHigh) == 1
+		extra            uint64
+		err              error
+	)
+
+	if lowAndHigh[0] == "*" || lowAndHigh[0] == "?" {
+		start = float64(r.min)
+		end = float64(r.max)
+		extra = starBit
+	} else {
+		start, err = mustParseDecimal(lowAndHigh[0])
+		if err != nil {
+			return 0, nil, err
+		}
+		switch len(lowAndHigh) {
+		case 1:
+			end = start
+		case 2:
+			end, err = mustParseDecimal(lowAndHigh[1])
+			if err != nil {
+				return 0, nil, err
+			}
+		default:
+			return 0, nil, fmt.Errorf("too many hyphens: %s", expr)
+		}
+	}
+
+	switch len(rangeAndStep) {
+	case 1:
+		step = 1
+	case 2:
+		step, err = mustParseDecimal(rangeAndStep[1])
+		if err != nil {
+			return 0, nil, err
+		}
+
+		// Special handling: "N/step" means "N-max/step".
+		if singleDigit {
+			end = float64(r.max)
+		}
+		if step > 1 {
+			extra = 0
+		}
+	default:
+		return 0, nil, fmt.Errorf("too many slashes: %s", expr)
+	}
+
+	if start < float64(r.min) {
+		return 0, nil, fmt.Errorf("beginning of range (%v) below minimum (%d): %s", start, r.min, expr)
+	}
+	if end >= float64(r.max)+1 {
+		return 0, nil, fmt.Errorf("end of range (%v) above maximum (%d): %s", end, r.max, expr)
+	}
+	if start > end {
+		return 0, nil, fmt.Errorf("beginning of range (%v) beyond end of range (%v): %s", start, end, expr)
+	}
+	if step <= 0 {
+		return 0, nil, fmt.Errorf("step of range should be a positive number: %s", expr)
+	}
+
+	// Split each value in the range into its whole-second bit and its
+	// sub-second offset. The epsilon keeps decimal steps such as 0.1 from
+	// drifting due to floating point accumulation.
+	const epsilon = 1e-6
+	var bits uint64
+	fractionSet := make(map[int]struct{})
+	for v := start; v <= end+epsilon; v += step {
+		whole := int(math.Floor(v + epsilon))
+		fraction := int(math.Round((v - float64(whole)) * float64(time.Second)))
+		if fraction >= int(time.Second) {
+			whole++
+			fraction = 0
+		}
+		if whole > int(r.max) {
+			break
+		}
+		bits |= 1 << uint(whole)
+		fractionSet[fraction] = struct{}{}
+	}
+
+	fractions := make([]int, 0, len(fractionSet))
+	for f := range fractionSet {
+		fractions = append(fractions, f)
+	}
+	sort.Ints(fractions)
+	return bits | extra, fractions, nil
+}
+
+// mustParseDecimal parses the given expression as a non-negative decimal
+// number or returns an error.
+func mustParseDecimal(expr string) (float64, error) {
+	num, err := strconv.ParseFloat(expr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse number from %s: %s", expr, err)
+	}
+	if num < 0 {
+		return 0, fmt.Errorf("negative number (%v) not allowed: %s", num, expr)
+	}
+
+	return num, nil
 }
 
 // getBits sets all bits in the range [min, max], modulo the given step size.

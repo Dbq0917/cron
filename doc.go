@@ -73,6 +73,15 @@ parser you saw earlier, except that its seconds field is REQUIRED:
 That emulates Quartz, the most popular alternative Cron schedule format:
 http://www.quartz-scheduler.org/documentation/quartz-2.x/tutorials/crontrigger.html
 
+Sub-second Schedules
+
+The seconds field additionally accepts decimal values, so schedules may
+activate at sub-second precision. For example, "0/0.5 * * * * ?" activates
+every half second, and "0.25 * * * * ?" activates a quarter second into each
+minute. Fractional values may be used anywhere a whole second value may be
+used, including in steps. Sub-second offsets apply to every second matched by
+the whole-second part of the field.
+
 Special Characters
 
 Asterisk ( * )
@@ -129,6 +138,9 @@ where "duration" is a string accepted by time.ParseDuration
 
 For example, "@every 1h30m10s" would indicate a schedule that activates after
 1 hour, 30 minutes, 10 seconds, and then every interval after that.
+
+Sub-second intervals, such as "@every 500ms", are supported and activate at
+their original precision.
 
 Note: The interval does not take the job runtime into account.  For example,
 if a job takes 3 minutes to run, and it is scheduled to run every 5 minutes,
@@ -223,7 +235,7 @@ Cron entries are stored in an array, sorted by their next activation time.  Cron
 sleeps until the next job is due to be run.
 
 Upon waking:
- - it runs each entry that is active on that second
+ - it runs each entry that is active at that instant
  - it calculates the next run times for the jobs that were run
  - it re-sorts the array of entries by next activation time.
  - it goes to sleep until the soonest job.

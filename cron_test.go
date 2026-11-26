@@ -293,6 +293,47 @@ func TestRunningMultipleSchedules(t *testing.T) {
 	}
 }
 
+// Add a job with a sub-second schedule, expect sub-second intervals between runs.
+func TestSubSecondSchedule(t *testing.T) {
+	var mu sync.Mutex
+	var runs []time.Time
+
+	cron := newWithSeconds()
+	_, err := cron.AddFunc("*/0.5 * * * * ?", func() {
+		mu.Lock()
+		runs = append(runs, time.Now())
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("expected sub-second spec to parse, got %v", err)
+	}
+	cron.Start()
+	defer cron.Stop()
+
+	// Wait for at least two runs.
+	deadline := time.After(2 * OneSecond)
+	for {
+		mu.Lock()
+		n := len(runs)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected at least 2 runs, got %d", n)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	interval := runs[1].Sub(runs[0])
+	mu.Unlock()
+	if interval < 450*time.Millisecond || interval > 800*time.Millisecond {
+		t.Errorf("expected runs to be ~500ms apart, got %v", interval)
+	}
+}
+
 // Test that the cron is run in the local time zone (as opposed to UTC).
 func TestLocalTimezone(t *testing.T) {
 	wg := &sync.WaitGroup{}

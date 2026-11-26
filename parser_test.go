@@ -77,6 +77,51 @@ func TestField(t *testing.T) {
 	}
 }
 
+func TestFractionalField(t *testing.T) {
+	half := int(500 * time.Millisecond)
+	fields := []struct {
+		expr      string
+		bits      uint64
+		fractions []int
+		err       string
+	}{
+		// Whole-second expressions yield no fractions.
+		{"5", 1 << 5, nil, ""},
+		{"*", all(seconds), nil, ""},
+
+		// Single fractional values.
+		{"0.5", 1 << 0, []int{half}, ""},
+		{"1.5", 1 << 1, []int{half}, ""},
+		{"0.25,0.75", 1 << 0, []int{250000000, 750000000}, ""},
+
+		// Fractional steps activate within every matched second.
+		{"*/0.5", all(seconds), []int{0, half}, ""},
+		{"0.5/5", 1<<0 | 1<<5 | 1<<10 | 1<<15 | 1<<20 | 1<<25 | 1<<30 | 1<<35 | 1<<40 | 1<<45 | 1<<50 | 1<<55, []int{half}, ""},
+
+		// Errors.
+		{"*/0", 0, nil, "should be a positive number"},
+		{"*/0.0", 0, nil, "should be a positive number"},
+		{"60.5", 0, nil, "above maximum"},
+		{"1.x", 0, nil, "failed to parse number"},
+	}
+
+	for _, c := range fields {
+		bits, fractions, err := getFractionalField(c.expr, seconds)
+		if len(c.err) != 0 && (err == nil || !strings.Contains(err.Error(), c.err)) {
+			t.Errorf("%s => expected %v, got %v", c.expr, c.err, err)
+		}
+		if len(c.err) == 0 && err != nil {
+			t.Errorf("%s => unexpected error %v", c.expr, err)
+		}
+		if len(c.err) == 0 && bits != c.bits {
+			t.Errorf("%s => expected bits %d, got %d", c.expr, c.bits, bits)
+		}
+		if len(c.err) == 0 && !reflect.DeepEqual(fractions, c.fractions) {
+			t.Errorf("%s => expected fractions %v, got %v", c.expr, c.fractions, fractions)
+		}
+	}
+}
+
 func TestAll(t *testing.T) {
 	allBits := []struct {
 		r        bounds
@@ -320,7 +365,7 @@ func TestStandardSpecSchedule(t *testing.T) {
 	}{
 		{
 			expr:     "5 * * * *",
-			expected: &SpecSchedule{1 << seconds.min, 1 << 5, all(hours), all(dom), all(months), all(dow), time.Local},
+			expected: &SpecSchedule{1 << seconds.min, 1 << 5, all(hours), all(dom), all(months), all(dow), nil, time.Local},
 		},
 		{
 			expr:     "@every 5m",
@@ -359,15 +404,15 @@ func TestNoDescriptorParser(t *testing.T) {
 }
 
 func every5min(loc *time.Location) *SpecSchedule {
-	return &SpecSchedule{1 << 0, 1 << 5, all(hours), all(dom), all(months), all(dow), loc}
+	return &SpecSchedule{1 << 0, 1 << 5, all(hours), all(dom), all(months), all(dow), nil, loc}
 }
 
 func every5min5s(loc *time.Location) *SpecSchedule {
-	return &SpecSchedule{1 << 5, 1 << 5, all(hours), all(dom), all(months), all(dow), loc}
+	return &SpecSchedule{1 << 5, 1 << 5, all(hours), all(dom), all(months), all(dow), nil, loc}
 }
 
 func midnight(loc *time.Location) *SpecSchedule {
-	return &SpecSchedule{1, 1, 1, all(dom), all(months), all(dow), loc}
+	return &SpecSchedule{1, 1, 1, all(dom), all(months), all(dow), nil, loc}
 }
 
 func annual(loc *time.Location) *SpecSchedule {

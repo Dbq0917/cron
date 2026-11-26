@@ -214,6 +214,53 @@ func TestErrors(t *testing.T) {
 	}
 }
 
+func TestFractionalSeconds(t *testing.T) {
+	runs := []struct {
+		time, spec string
+		expected   string
+	}{
+		// Every half second.
+		{"Mon Jul 9 14:45:00 2012", "*/0.5 * * * * ?", "Mon Jul 9 14:45:00.5 2012"},
+		{"Mon Jul 9 14:45:00.100 2012", "*/0.5 * * * * ?", "Mon Jul 9 14:45:00.5 2012"},
+		{"Mon Jul 9 14:45:00.500 2012", "*/0.5 * * * * ?", "Mon Jul 9 14:45:01 2012"},
+
+		// Wrap around minutes, hours, and days.
+		{"Mon Jul 9 14:45:59.500 2012", "*/0.5 * * * * ?", "Mon Jul 9 14:46:00 2012"},
+		{"Mon Jul 9 14:59:59.500 2012", "*/0.5 * * * * ?", "Mon Jul 9 15:00:00 2012"},
+		{"Mon Jul 9 23:59:59.500 2012", "*/0.5 * * * * ?", "Tue Jul 10 00:00:00 2012"},
+
+		// Single fractional second.
+		{"Mon Jul 9 14:45:00 2012", "0.5 * * * * ?", "Mon Jul 9 14:45:00.5 2012"},
+		{"Mon Jul 9 14:45:00.600 2012", "0.5 * * * * ?", "Mon Jul 9 14:46:00.5 2012"},
+		{"Mon Jul 9 14:45:00.250 2012", "1.5 * * * * ?", "Mon Jul 9 14:45:01.5 2012"},
+		{"Mon Jul 9 14:45:01.500 2012", "1.5 * * * * ?", "Mon Jul 9 14:46:01.5 2012"},
+
+		// Fractional second with a step.
+		{"Mon Jul 9 14:45:00.400 2012", "0.5/5 * * * * ?", "Mon Jul 9 14:45:00.5 2012"},
+		{"Mon Jul 9 14:45:00.500 2012", "0.5/5 * * * * ?", "Mon Jul 9 14:45:05.5 2012"},
+
+		// Sub-second steps align within each second.
+		{"Mon Jul 9 14:45:00.050 2012", "*/0.1 * * * * ?", "Mon Jul 9 14:45:00.1 2012"},
+		{"Mon Jul 9 14:45:00.999 2012", "*/0.1 * * * * ?", "Mon Jul 9 14:45:01 2012"},
+
+		// Whole-second schedules are unaffected.
+		{"Mon Jul 9 14:45:00.500 2012", "* * * * * ?", "Mon Jul 9 14:45:01 2012"},
+	}
+
+	for _, c := range runs {
+		sched, err := secondParser.Parse(c.spec)
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		actual := sched.Next(getTime(c.time))
+		expected := getTime(c.expected)
+		if !actual.Equal(expected) {
+			t.Errorf("%s, \"%s\": (expected) %v != %v (actual)", c.time, c.spec, expected, actual)
+		}
+	}
+}
+
 func getTime(value string) time.Time {
 	if value == "" {
 		return time.Time{}
