@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -11,19 +12,20 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries   []*Entry
-	chain     Chain
-	stop      chan struct{}
-	add       chan *Entry
-	remove    chan EntryID
-	snapshot  chan chan []Entry
-	running   bool
-	logger    Logger
-	runningMu sync.Mutex
-	location  *time.Location
-	parser    ScheduleParser
-	nextID    EntryID
-	jobWaiter sync.WaitGroup
+	entries    []*Entry
+	chain      Chain
+	stop       chan struct{}
+	add        chan *Entry
+	remove     chan EntryID
+	snapshot   chan chan []Entry
+	running    bool
+	logger     Logger
+	runningMu  sync.Mutex
+	location   *time.Location
+	parser     ScheduleParser
+	nextID     EntryID
+	jobWaiter  sync.WaitGroup
+	jobTimeout time.Duration
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -35,6 +37,24 @@ type ScheduleParser interface {
 type Job interface {
 	Run()
 }
+
+// JobContext is implemented by jobs that accept a context for each run.
+// The context is canceled when the run exceeds its configured timeout.
+type JobContext interface {
+	Run(context.Context)
+}
+
+// ContextJob and JobWithContext are aliases for JobContext.
+type ContextJob = JobContext
+type JobWithContext = JobContext
+
+// JobContextError is implemented by context-aware jobs that report an error.
+type JobContextError interface {
+	Run(context.Context) error
+}
+
+// ContextJobWithError is an alias for JobContextError.
+type ContextJobWithError = JobContextError
 
 // Schedule describes a job's duty cycle.
 type Schedule interface {
@@ -61,6 +81,10 @@ type Entry struct {
 
 	// Prev is the last time this job was run, or the zero time if never.
 	Prev time.Time
+
+	// Timeout is the maximum duration of each run. A zero value uses the
+	// Cron's configured job timeout.
+	Timeout time.Duration
 
 	// WrappedJob is the thing to run when the Schedule is activated.
 	WrappedJob Job
@@ -109,6 +133,10 @@ func (s byTime) Less(i, j int) bool {
 //     Description: Wrap submitted jobs to customize behavior.
 //     Default:     A chain that recovers panics and logs them to stderr.
 //
+//   Job Timeout
+//     Description: Maximum duration of each job invocation.
+//     Default:     No timeout.
+//
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
@@ -135,17 +163,104 @@ type FuncJob func()
 
 func (f FuncJob) Run() { f() }
 
+// FuncJobContext turns a func(context.Context) into a context-aware job.
+type FuncJobContext func(context.Context)
+
+// FuncJobWithContext is an alias for FuncJobContext.
+type FuncJobWithContext = FuncJobContext
+
+// Run calls the function with the supplied context.
+func (f FuncJobContext) Run(ctx context.Context) { f(ctx) }
+
+// RunContext calls the function with the supplied context.
+func (f FuncJobContext) RunContext(ctx context.Context) { f(ctx) }
+
+// FuncJobContextError turns a func(context.Context) error into a context-aware
+// job that reports its result.
+type FuncJobContextError func(context.Context) error
+
+// FuncJobWithContextError is an alias for FuncJobContextError.
+type FuncJobWithContextError = FuncJobContextError
+
+// Run calls the function with the supplied context.
+func (f FuncJobContextError) Run(ctx context.Context) error { return f(ctx) }
+
+type contextFuncJob func(context.Context) error
+
+func (f contextFuncJob) Run() { _ = f(context.Background()) }
+
+func (f contextFuncJob) RunContext(ctx context.Context) error { return f(ctx) }
+
+type jobAdapter struct {
+	job interface{}
+}
+
+func (j *jobAdapter) Run() { _ = runJob(context.Background(), j.job) }
+
+func (j *jobAdapter) RunContext(ctx context.Context) error { return runJob(ctx, j.job) }
+
+func runJob(ctx context.Context, job interface{}) error {
+	switch j := job.(type) {
+	case interface {
+		RunContext(context.Context) error
+	}:
+		return j.RunContext(ctx)
+	case interface {
+		Run(context.Context) error
+	}:
+		return j.Run(ctx)
+	case interface {
+		RunContext(context.Context)
+	}:
+		j.RunContext(ctx)
+	case JobContext:
+		j.Run(ctx)
+	case Job:
+		j.Run()
+	default:
+		panic(fmt.Sprintf("cron: unsupported job type %T", job))
+	}
+	return nil
+}
+
+func asJob(job interface{}) (Job, error) {
+	switch j := job.(type) {
+	case func():
+		return FuncJob(j), nil
+	case func(context.Context):
+		return &jobAdapter{job: FuncJobContext(j)}, nil
+	case func(context.Context) error:
+		return &jobAdapter{job: FuncJobContextError(j)}, nil
+	case Job:
+		return j, nil
+	case JobContext:
+		return &jobAdapter{job: j}, nil
+	case JobContextError:
+		return &jobAdapter{job: j}, nil
+	case interface {
+		RunContext(context.Context) error
+	}:
+		return &jobAdapter{job: j}, nil
+	case interface {
+		RunContext(context.Context)
+	}:
+		return &jobAdapter{job: j}, nil
+	default:
+		return nil, fmt.Errorf("cron: unsupported job type %T", job)
+	}
+}
+
 // AddFunc adds a func to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(spec string, cmd interface{}) (EntryID, error) {
+	return c.AddJob(spec, cmd)
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+func (c *Cron) AddJob(spec string, cmd interface{}) (EntryID, error) {
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
 		return 0, err
@@ -153,9 +268,35 @@ func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
 	return c.Schedule(schedule, cmd), nil
 }
 
+// AddFuncContext adds a context-aware func to the Cron to be run on the given
+// schedule.
+func (c *Cron) AddFuncContext(spec string, cmd func(context.Context)) (EntryID, error) {
+	return c.AddJob(spec, FuncJobContext(cmd))
+}
+
+// AddFuncContextError adds a context-aware func that returns an error.
+func (c *Cron) AddFuncContextError(spec string, cmd func(context.Context) error) (EntryID, error) {
+	return c.AddJob(spec, FuncJobContextError(cmd))
+}
+
+// AddJobContext adds a context-aware Job to the Cron to be run on the given
+// schedule.
+func (c *Cron) AddJobContext(spec string, cmd JobContext) (EntryID, error) {
+	return c.AddJob(spec, cmd)
+}
+
+// AddJobContextError adds a context-aware Job that returns an error.
+func (c *Cron) AddJobContextError(spec string, cmd JobContextError) (EntryID, error) {
+	return c.AddJob(spec, cmd)
+}
+
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+func (c *Cron) Schedule(schedule Schedule, cmd interface{}) EntryID {
+	job, err := asJob(cmd)
+	if err != nil {
+		panic(err)
+	}
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
@@ -163,7 +304,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		ID:         c.nextID,
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
-		Job:        cmd,
+		Job:        job,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -270,7 +411,7 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+					c.startJob(e)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
@@ -305,11 +446,26 @@ func (c *Cron) run() {
 }
 
 // startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
+func (c *Cron) startJob(entry *Entry) {
+	timeout := entry.Timeout
+	if timeout == 0 {
+		timeout = c.jobTimeout
+	}
 	c.jobWaiter.Add(1)
 	go func() {
 		defer c.jobWaiter.Done()
-		j.Run()
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		err := runJob(ctx, entry.WrappedJob)
+		if timeout > 0 && ctx.Err() == context.DeadlineExceeded {
+			c.logger.Error(ctx.Err(), "timeout", "entry", entry.ID)
+		} else if err != nil {
+			c.logger.Error(err, "job", "entry", entry.ID)
+		}
 	}()
 }
 

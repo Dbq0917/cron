@@ -43,3 +43,17 @@ func WithLogger(logger Logger) Option {
 		c.logger = logger
 	}
 }
+
+// WithJobTimeout sets the maximum duration of each job invocation. The job's
+// context is canceled when the timeout expires, but the scheduler still waits
+// for the job to return before considering it complete.
+func WithJobTimeout(timeout time.Duration) Option {
+	return func(c *Cron) {
+		c.jobTimeout = timeout
+	}
+}
+
+// WithTimeout is an alias for WithJobTimeout.
+func WithTimeout(timeout time.Duration) Option {
+	return WithJobTimeout(timeout)
+}

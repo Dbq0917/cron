@@ -192,6 +192,27 @@ Install wrappers for individual jobs by explicitly wrapping them:
 		cron.SkipIfStillRunning(logger),
 	).Then(job)
 
+Job Timeouts
+
+Jobs that accept a context can enforce a per-run time limit. The context is
+canceled when the limit expires, while the scheduler still waits for the job to
+return before releasing serialization wrappers or completing Stop.
+
+	cron.New(cron.WithJobTimeout(30 * time.Second)).AddFunc(
+		"@every 1m",
+		func(ctx context.Context) {
+			// Use ctx for downstream calls.
+		},
+	)
+
+The same limit can be applied to one job with the Timeout wrapper:
+
+	job = cron.NewChain(
+		cron.Timeout(30 * time.Second),
+	).Then(cron.FuncJobContext(func(ctx context.Context) {
+		// Use ctx for downstream calls.
+	}))
+
 Thread safety
 
 Since the Cron service runs concurrently with the calling code, some amount of

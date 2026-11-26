@@ -1,9 +1,9 @@
 package cron
 
 import (
+	"context"
 	"fmt"
 	"runtime"
-	"sync"
 	"time"
 )
 
@@ -27,7 +27,11 @@ func NewChain(c ...JobWrapper) Chain {
 //     NewChain(m1, m2, m3).Then(job)
 // is equivalent to:
 //     m1(m2(m3(job)))
-func (c Chain) Then(j Job) Job {
+func (c Chain) Then(job interface{}) Job {
+	j, err := asJob(job)
+	if err != nil {
+		panic(err)
+	}
 	for i := range c.wrappers {
 		j = c.wrappers[len(c.wrappers)-i-1](j)
 	}
@@ -37,7 +41,7 @@ func (c Chain) Then(j Job) Job {
 // Recover panics in wrapped jobs and log them with the provided logger.
 func Recover(logger Logger) JobWrapper {
 	return func(j Job) Job {
-		return FuncJob(func() {
+		return contextFuncJob(func(ctx context.Context) error {
 			defer func() {
 				if r := recover(); r != nil {
 					const size = 64 << 10
@@ -50,7 +54,7 @@ func Recover(logger Logger) JobWrapper {
 					logger.Error(err, "panic", "stack", "...\n"+string(buf))
 				}
 			}()
-			j.Run()
+			return runJob(ctx, j)
 		})
 	}
 }
@@ -60,15 +64,22 @@ func Recover(logger Logger) JobWrapper {
 // have the delay logged at Info.
 func DelayIfStillRunning(logger Logger) JobWrapper {
 	return func(j Job) Job {
-		var mu sync.Mutex
-		return FuncJob(func() {
+		ch := make(chan struct{}, 1)
+		return contextFuncJob(func(ctx context.Context) error {
 			start := time.Now()
-			mu.Lock()
-			defer mu.Unlock()
+			select {
+			case ch <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			defer func() { <-ch }()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if dur := time.Since(start); dur > time.Minute {
 				logger.Info("delay", "duration", dur)
 			}
-			j.Run()
+			return runJob(ctx, j)
 		})
 	}
 }
@@ -79,14 +90,53 @@ func SkipIfStillRunning(logger Logger) JobWrapper {
 	return func(j Job) Job {
 		var ch = make(chan struct{}, 1)
 		ch <- struct{}{}
-		return FuncJob(func() {
+		return contextFuncJob(func(ctx context.Context) error {
 			select {
 			case v := <-ch:
 				defer func() { ch <- v }()
-				j.Run()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return runJob(ctx, j)
 			default:
 				logger.Info("skip")
 			}
+			return nil
 		})
 	}
+}
+
+// Timeout limits each invocation of the wrapped job to the given duration.
+// When the timeout expires, the job's context is canceled. The wrapper still
+// waits for the job to return, so serialization wrappers and Stop observe a
+// real completion rather than an abandoned goroutine.
+func Timeout(timeout time.Duration, loggers ...Logger) JobWrapper {
+	var logger Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
+	return func(j Job) Job {
+		return contextFuncJob(func(ctx context.Context) error {
+			if timeout <= 0 {
+				return runJob(ctx, j)
+			}
+			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			err := runJob(timeoutCtx, j)
+			if logger != nil && timeoutCtx.Err() == context.DeadlineExceeded {
+				logger.Error(timeoutCtx.Err(), "timeout")
+			}
+			return err
+		})
+	}
+}
+
+// JobTimeout is an alias for Timeout.
+func JobTimeout(timeout time.Duration, loggers ...Logger) JobWrapper {
+	return Timeout(timeout, loggers...)
+}
+
+// TimeoutJob is an alias for Timeout.
+func TimeoutJob(timeout time.Duration, loggers ...Logger) JobWrapper {
+	return Timeout(timeout, loggers...)
 }
